@@ -14,7 +14,7 @@
        serve para os dois (o que é do fornecedor, obrigatório e editável).
      - Pré-ficha e ficha completa são visíveis a todas as áreas internas. O fornecedor
        só vê campos marcados (VisivelFornecedor) ou que ele mesmo preenche.
-     - Status da ficha = fase em que ela está (não a área).
+     - Status da ficha = fase em que ela está (não a área). Reprovação devolve ao fornecedor (EM_AJUSTE).
    ============================================================================= */
 
 /* ---------- 1. Áreas ---------- */
@@ -122,24 +122,46 @@ CREATE TABLE dbo.PF_CampoArea (
 /* ---------- 5. Pré-ficha / ficha: status, aprovação e valores ----------
    Status = fase da ficha:
      PRE_FICHA_PREENCHIMENTO -> PRE_FICHA_APROVACAO -> FICHA_COMPLETA -> CONCLUIDA
-     (REJEITADA e CANCELADA encerram a ficha)
-   Na ficha completa todas as áreas atuam em paralelo. */
+     EM_AJUSTE  = reprovada (total ou parcial) e devolvida ao fornecedor, que volta a
+                  editar; FaseRetorno guarda a fase de onde ela saiu e para onde volta.
+     CANCELADA  = encerrada.
+   Na ficha completa todas as áreas atuam em paralelo.
+   Ciclo = número da rodada de aprovação (sobe a cada reenvio após reprovação). */
 CREATE TABLE dbo.PF_PreFicha (
     PreFichaCodigo      INT IDENTITY(1,1) CONSTRAINT PK_PF_PreFicha PRIMARY KEY,
     FornecedorUsuarioId INT         NOT NULL,
     Status              VARCHAR(25) NOT NULL CONSTRAINT DF_PF_PreFicha_Status DEFAULT 'PRE_FICHA_PREENCHIMENTO',
+    FaseRetorno         VARCHAR(25) NULL,
+    Ciclo               INT         NOT NULL CONSTRAINT DF_PF_PreFicha_Ciclo DEFAULT 1,
     CriadaEm            DATETIME2   NOT NULL CONSTRAINT DF_PF_PreFicha_Criada DEFAULT SYSUTCDATETIME(),
     AtualizadaEm        DATETIME2   NOT NULL CONSTRAINT DF_PF_PreFicha_Atual  DEFAULT SYSUTCDATETIME(),
     CONSTRAINT CK_PF_PreFicha_Status CHECK (Status IN
-        ('PRE_FICHA_PREENCHIMENTO','PRE_FICHA_APROVACAO','FICHA_COMPLETA','CONCLUIDA','REJEITADA','CANCELADA'))
+        ('PRE_FICHA_PREENCHIMENTO','PRE_FICHA_APROVACAO','FICHA_COMPLETA','CONCLUIDA','EM_AJUSTE','CANCELADA')),
+    CONSTRAINT CK_PF_PreFicha_Retorno CHECK (
+           (Status = 'EM_AJUSTE' AND FaseRetorno IN ('PRE_FICHA_APROVACAO','FICHA_COMPLETA'))
+        OR (Status <> 'EM_AJUSTE' AND FaseRetorno IS NULL))
 );
 
-/* Áreas que aprovam a pré-ficha, escolhidas no momento da aprovação.
+/* Fluxo de aprovação da pré-ficha, definido na CONFIGURAÇÃO (vale para toda ficha).
    Ordem igual  = aprovação simultânea; Ordem diferente = sequencial (menor primeiro).
-   Ex.: Compras(1), GC(1), Fiscal(2) -> Compras e GC juntas, depois Fiscal. */
+   Ex.: Compras(1), GC(1), Fiscal(2) -> Compras e GC juntas, depois Fiscal.
+   Só áreas INTERNAS (validar na tela do construtor). */
+CREATE TABLE dbo.PF_AprovacaoConfig (
+    AreaId  INT NOT NULL CONSTRAINT PK_PF_AprovacaoConfig PRIMARY KEY,
+    Ordem   INT NOT NULL,
+    Ativo   BIT NOT NULL CONSTRAINT DF_PF_AprovCfg_Ativo DEFAULT 1,
+    SysIni  DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL,
+    SysFim  DATETIME2 GENERATED ALWAYS AS ROW END   HIDDEN NOT NULL,
+    PERIOD FOR SYSTEM_TIME (SysIni, SysFim),
+    CONSTRAINT FK_PF_AprovCfg_Area FOREIGN KEY (AreaId) REFERENCES dbo.PF_Area (AreaId)
+) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.PF_AprovacaoConfigHist));
+
+/* Cópia (snapshot) do fluxo para a ficha a cada ciclo, com a decisão de cada área.
+   Mudar a configuração não altera fichas em andamento. */
 CREATE TABLE dbo.PF_PreFichaAprovacao (
     PreFichaAprovacaoId INT IDENTITY(1,1) CONSTRAINT PK_PF_PreFichaAprovacao PRIMARY KEY,
     PreFichaCodigo      INT           NOT NULL,
+    Ciclo               INT           NOT NULL,
     AreaId              INT           NOT NULL,
     Ordem               INT           NOT NULL,
     Situacao            VARCHAR(10)   NOT NULL CONSTRAINT DF_PF_PFA_Situacao DEFAULT 'PENDENTE',
@@ -148,9 +170,30 @@ CREATE TABLE dbo.PF_PreFichaAprovacao (
     Motivo              NVARCHAR(500) NULL,
     CONSTRAINT FK_PF_PFA_Ficha FOREIGN KEY (PreFichaCodigo) REFERENCES dbo.PF_PreFicha (PreFichaCodigo),
     CONSTRAINT FK_PF_PFA_Area  FOREIGN KEY (AreaId)         REFERENCES dbo.PF_Area (AreaId),
-    CONSTRAINT UQ_PF_PFA UNIQUE (PreFichaCodigo, AreaId),
+    CONSTRAINT UQ_PF_PFA UNIQUE (PreFichaCodigo, Ciclo, AreaId),
     CONSTRAINT CK_PF_PFA_Situacao CHECK (Situacao IN ('PENDENTE','APROVADO','REJEITADO'))
 );
+
+/* Pendências da reprovação.
+   CampoId NULL = reprovação TOTAL (o fornecedor reabre todos os campos dele).
+   CampoId preenchido = reprovação PARCIAL (só esse campo é liberado ao fornecedor). */
+CREATE TABLE dbo.PF_PreFichaPendencia (
+    PendenciaId    INT IDENTITY(1,1) CONSTRAINT PK_PF_PreFichaPendencia PRIMARY KEY,
+    PreFichaCodigo INT           NOT NULL,
+    Ciclo          INT           NOT NULL,
+    AreaId         INT           NOT NULL,
+    CampoId        INT           NULL,
+    Motivo         NVARCHAR(500) NOT NULL,
+    Situacao       VARCHAR(10)   NOT NULL CONSTRAINT DF_PF_PFP_Situacao DEFAULT 'ABERTA',
+    CriadaPor      INT           NOT NULL,
+    CriadaEm       DATETIME2     NOT NULL CONSTRAINT DF_PF_PFP_Criada DEFAULT SYSUTCDATETIME(),
+    ResolvidaEm    DATETIME2     NULL,
+    CONSTRAINT FK_PF_PFP_Ficha FOREIGN KEY (PreFichaCodigo) REFERENCES dbo.PF_PreFicha (PreFichaCodigo),
+    CONSTRAINT FK_PF_PFP_Area  FOREIGN KEY (AreaId)         REFERENCES dbo.PF_Area (AreaId),
+    CONSTRAINT FK_PF_PFP_Campo FOREIGN KEY (CampoId)        REFERENCES dbo.PF_Campo (CampoId),
+    CONSTRAINT CK_PF_PFP_Situacao CHECK (Situacao IN ('ABERTA','RESOLVIDA'))
+);
+CREATE INDEX IX_PF_PFP_Ficha ON dbo.PF_PreFichaPendencia (PreFichaCodigo, Situacao);
 
 /* Valores tipados: texto OU número, nunca os dois. Sem conversão implícita. */
 CREATE TABLE dbo.PF_PreFichaValor (
@@ -324,16 +367,19 @@ RETURNS TABLE AS RETURN
 );
 GO
 
-/* Aprovações que podem ser decididas agora (grupo pendente de menor Ordem) */
+/* Aprovações que podem ser decididas agora, no ciclo atual
+   (grupo pendente de menor Ordem: simultâneas juntas, sequenciais uma após a outra) */
 CREATE FUNCTION dbo.PF_fn_AprovacoesLiberadas (@PreFichaCodigo INT)
 RETURNS TABLE AS RETURN
 (
     SELECT a.PreFichaAprovacaoId, a.AreaId, a.Ordem
-    FROM dbo.PF_PreFichaAprovacao a
-    WHERE a.PreFichaCodigo = @PreFichaCodigo
+    FROM dbo.PF_PreFicha f
+    JOIN dbo.PF_PreFichaAprovacao a ON a.PreFichaCodigo = f.PreFichaCodigo AND a.Ciclo = f.Ciclo
+    WHERE f.PreFichaCodigo = @PreFichaCodigo
+      AND f.Status = 'PRE_FICHA_APROVACAO'
       AND a.Situacao = 'PENDENTE'
       AND a.Ordem = (SELECT MIN(b.Ordem) FROM dbo.PF_PreFichaAprovacao b
-                     WHERE b.PreFichaCodigo = @PreFichaCodigo AND b.Situacao = 'PENDENTE')
+                     WHERE b.PreFichaCodigo = f.PreFichaCodigo AND b.Ciclo = f.Ciclo AND b.Situacao = 'PENDENTE')
 );
 GO
 
@@ -354,9 +400,11 @@ GO
    @ValoresJson: [{"campoId":1,"valor":"texto"}, ...]  (número com ponto decimal)
    @ValidarObrigatorios = 1 ao concluir a fase (valida o que falta preencher)
    Regras:
-     - ficha encerrada (CONCLUIDA/REJEITADA/CANCELADA) não aceita alteração
+     - ficha encerrada (CONCLUIDA/CANCELADA) não aceita alteração
      - fornecedor não altera durante a aprovação da pré-ficha
-     - campo da ficha completa só é aceito na fase FICHA_COMPLETA
+     - ficha EM_AJUSTE (reprovada): só o fornecedor edita (e o ADMIN); em reprovação
+       total ele reabre todos os campos dele, em parcial só os campos com pendência aberta
+     - campo da ficha completa só é aceito quando a fase (ou a FaseRetorno) é FICHA_COMPLETA
      - campo precisa estar acessível, ativo e editável para o usuário
      - texto: tamanho do campo e sem caracteres de controle (seguro para ERP)
      - número: ponto decimal, até CasasDecimais, dentro de decimal(18,4)
@@ -374,17 +422,27 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
-    DECLARE @Status VARCHAR(25), @Fornecedor INT, @Perfil VARCHAR(10) = dbo.PF_fn_PerfilUsuario(@UsuarioCosmosId);
-    SELECT @Status = Status, @Fornecedor = FornecedorUsuarioId FROM dbo.PF_PreFicha WHERE PreFichaCodigo = @PreFichaCodigo;
+    DECLARE @Status VARCHAR(25), @FaseRetorno VARCHAR(25), @Fornecedor INT,
+            @Perfil VARCHAR(10) = dbo.PF_fn_PerfilUsuario(@UsuarioCosmosId);
+    SELECT @Status = Status, @FaseRetorno = FaseRetorno, @Fornecedor = FornecedorUsuarioId
+    FROM dbo.PF_PreFicha WHERE PreFichaCodigo = @PreFichaCodigo;
 
     IF @Status IS NULL THROW 50001, 'Ficha não encontrada.', 1;
     IF @Perfil IS NULL THROW 50002, 'Usuário sem perfil na plataforma.', 1;
     IF @Perfil = 'FORNECEDOR' AND @Fornecedor <> @UsuarioCosmosId
         THROW 50003, 'Fornecedor só pode alterar a própria ficha.', 1;
-    IF @Status IN ('CONCLUIDA','REJEITADA','CANCELADA')
+    IF @Status IN ('CONCLUIDA','CANCELADA')
         THROW 50004, 'Ficha encerrada não aceita alterações.', 1;
     IF @Perfil = 'FORNECEDOR' AND @Status = 'PRE_FICHA_APROVACAO'
         THROW 50005, 'Pré-ficha em aprovação: o fornecedor não pode alterar.', 1;
+    IF @Perfil = 'AREA' AND @Status = 'EM_AJUSTE'
+        THROW 50006, 'Ficha devolvida ao fornecedor para ajuste.', 1;
+
+    -- Fase efetiva: em ajuste, vale a fase de onde a ficha saiu
+    DECLARE @Fase VARCHAR(25) = CASE WHEN @Status = 'EM_AJUSTE' THEN @FaseRetorno ELSE @Status END;
+    DECLARE @ReprovacaoTotal BIT = CASE WHEN EXISTS (
+        SELECT 1 FROM dbo.PF_PreFichaPendencia
+        WHERE PreFichaCodigo = @PreFichaCodigo AND Situacao = 'ABERTA' AND CampoId IS NULL) THEN 1 ELSE 0 END;
 
     -- Valor vazio = NULL
     SELECT CampoId, NULLIF(LTRIM(RTRIM(Valor)), N'') AS Valor
@@ -408,7 +466,14 @@ BEGIN
     INSERT #Erros SELECT CONCAT(Descricao, N': campo cancelado.') FROM #V WHERE Ativo = 0;
     INSERT #Erros SELECT CONCAT(Descricao, N': sem permissão de edição.') FROM #V WHERE Ativo = 1 AND Editavel = 0;
     INSERT #Erros SELECT CONCAT(Descricao, N': campo da ficha completa não pode ser preenchido antes dessa fase.')
-    FROM #V WHERE Etapa = 'FICHA_COMPLETA' AND @Status <> 'FICHA_COMPLETA';
+    FROM #V WHERE Etapa = 'FICHA_COMPLETA' AND @Fase <> 'FICHA_COMPLETA';
+
+    -- Fornecedor em ajuste: reprovação parcial libera só os campos com pendência aberta
+    INSERT #Erros SELECT CONCAT(Descricao, N': campo não liberado para ajuste.')
+    FROM #V
+    WHERE @Perfil = 'FORNECEDOR' AND @Status = 'EM_AJUSTE' AND @ReprovacaoTotal = 0 AND Descricao IS NOT NULL
+      AND CampoId NOT IN (SELECT CampoId FROM dbo.PF_PreFichaPendencia
+                          WHERE PreFichaCodigo = @PreFichaCodigo AND Situacao = 'ABERTA' AND CampoId IS NOT NULL);
 
     -- Texto: tamanho e caracteres de controle (curto: nenhum; longo: permite tab, CR e LF)
     DECLARE @RxCurto NVARCHAR(40) = N'%[' + NCHAR(1) + N'-' + NCHAR(31) + N']%';
@@ -445,7 +510,7 @@ BEGIN
         LEFT JOIN #In i ON i.CampoId = cu.CampoId
         LEFT JOIN dbo.PF_PreFichaValor pv ON pv.PreFichaCodigo = @PreFichaCodigo AND pv.CampoId = cu.CampoId
         WHERE cu.Obrigatorio = 1 AND cu.Editavel = 1
-          AND (cu.Etapa = 'PRE_FICHA' OR @Status = 'FICHA_COMPLETA')
+          AND (cu.Etapa = 'PRE_FICHA' OR @Fase = 'FICHA_COMPLETA')
           AND (CASE WHEN i.CampoId IS NOT NULL THEN CASE WHEN i.Valor IS NULL THEN 0 ELSE 1 END
                     WHEN pv.ValorTexto IS NOT NULL OR pv.ValorNumero IS NOT NULL THEN 1
                     ELSE 0 END) = 0;
@@ -509,8 +574,16 @@ GO
    TODO (fora do desenho atual)
    - Skill + MCP Cosmos Pro para criar tabelas, formulários e customs PF_.
    - Resolver o usuário logado pela sessão/token do Cosmos (confirmar suporte).
-   - Custom actions de workflow: enviar para aprovação (gravar PF_PreFichaAprovacao),
-     aprovar/rejeitar por área, avançar Status, concluir.
+   - Custom actions de workflow:
+       * enviar para aprovação: copiar PF_AprovacaoConfig para PF_PreFichaAprovacao no
+         Ciclo atual, validar obrigatórios, Status = PRE_FICHA_APROVACAO;
+       * aprovar/rejeitar por área (rejeitar grava PF_PreFichaPendencia: total = CampoId
+         NULL, parcial = um registro por campo), avançar para FICHA_COMPLETA e CONCLUIDA;
+       * devolver ao fornecedor: Status = EM_AJUSTE + FaseRetorno;
+       * reenviar: resolver pendências, Ciclo + 1, voltar à FaseRetorno.
+   - Reprovação parcial na FICHA_COMPLETA (áreas em paralelo): definir se as demais
+     áreas continuam trabalhando enquanto o fornecedor ajusta.
+   - Tela de configuração do fluxo de aprovação (PF_AprovacaoConfig).
    - Processo de envio das integrações: montar payload (PF_fn_PayloadIntegracao),
      enviar, gravar PF_IntegracaoEnvioLog e atualizar PF_IntegracaoEnvio; reenvio.
    - Concorrência de edição (v2).
