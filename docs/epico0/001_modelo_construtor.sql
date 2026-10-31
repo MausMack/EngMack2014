@@ -122,25 +122,41 @@ CREATE TABLE dbo.PF_CampoArea (
 /* ---------- 5. Pré-ficha / ficha: status, aprovação e valores ----------
    Status = fase da ficha:
      PRE_FICHA_PREENCHIMENTO -> PRE_FICHA_APROVACAO -> FICHA_COMPLETA -> CONCLUIDA
-     EM_AJUSTE  = reprovada (total ou parcial) e devolvida ao fornecedor, que volta a
-                  editar; FaseRetorno guarda a fase de onde ela saiu e para onde volta.
-     CANCELADA  = encerrada.
+     EM_AJUSTE  = devolvida ao fornecedor (total ou parcial); ele volta a editar,
+                  só os campos reprovados no caso parcial. FaseRetorno guarda a fase
+                  de onde ela saiu e para onde volta.
+     REJEITADA  = rejeição definitiva do produto (status final). Bloqueia novo pedido
+                  do mesmo EAN até BloqueadoAte (parâmetro geral), salvo liberação do gestor.
+     CANCELADA  = encerrada (status final).
    Na ficha completa todas as áreas atuam em paralelo.
-   Ciclo = número da rodada de aprovação (sobe a cada reenvio após reprovação). */
+   Ciclo = número da rodada de aprovação (sobe a cada reenvio após devolução).
+   EAN é a chave do produto (GTIN normalizado em 14 dígitos, ver PF_fn_NormalizarEAN). */
 CREATE TABLE dbo.PF_PreFicha (
     PreFichaCodigo      INT IDENTITY(1,1) CONSTRAINT PK_PF_PreFicha PRIMARY KEY,
-    FornecedorUsuarioId INT         NOT NULL,
-    Status              VARCHAR(25) NOT NULL CONSTRAINT DF_PF_PreFicha_Status DEFAULT 'PRE_FICHA_PREENCHIMENTO',
-    FaseRetorno         VARCHAR(25) NULL,
-    Ciclo               INT         NOT NULL CONSTRAINT DF_PF_PreFicha_Ciclo DEFAULT 1,
-    CriadaEm            DATETIME2   NOT NULL CONSTRAINT DF_PF_PreFicha_Criada DEFAULT SYSUTCDATETIME(),
-    AtualizadaEm        DATETIME2   NOT NULL CONSTRAINT DF_PF_PreFicha_Atual  DEFAULT SYSUTCDATETIME(),
+    EAN                 VARCHAR(14)   NOT NULL,
+    FornecedorUsuarioId INT           NOT NULL,
+    Status              VARCHAR(25)   NOT NULL CONSTRAINT DF_PF_PreFicha_Status DEFAULT 'PRE_FICHA_PREENCHIMENTO',
+    FaseRetorno         VARCHAR(25)   NULL,
+    Ciclo               INT           NOT NULL CONSTRAINT DF_PF_PreFicha_Ciclo DEFAULT 1,
+    RejeitadaEm         DATETIME2     NULL,
+    BloqueadoAte        DATETIME2     NULL,
+    MotivoRejeicao      NVARCHAR(500) NULL,
+    CriadaEm            DATETIME2     NOT NULL CONSTRAINT DF_PF_PreFicha_Criada DEFAULT SYSUTCDATETIME(),
+    AtualizadaEm        DATETIME2     NOT NULL CONSTRAINT DF_PF_PreFicha_Atual  DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT CK_PF_PreFicha_EAN CHECK (LEN(EAN) = 14 AND EAN NOT LIKE '%[^0-9]%'),
     CONSTRAINT CK_PF_PreFicha_Status CHECK (Status IN
-        ('PRE_FICHA_PREENCHIMENTO','PRE_FICHA_APROVACAO','FICHA_COMPLETA','CONCLUIDA','EM_AJUSTE','CANCELADA')),
+        ('PRE_FICHA_PREENCHIMENTO','PRE_FICHA_APROVACAO','FICHA_COMPLETA','CONCLUIDA','EM_AJUSTE','REJEITADA','CANCELADA')),
     CONSTRAINT CK_PF_PreFicha_Retorno CHECK (
            (Status = 'EM_AJUSTE' AND FaseRetorno IN ('PRE_FICHA_APROVACAO','FICHA_COMPLETA'))
-        OR (Status <> 'EM_AJUSTE' AND FaseRetorno IS NULL))
+        OR (Status <> 'EM_AJUSTE' AND FaseRetorno IS NULL)),
+    CONSTRAINT CK_PF_PreFicha_Rejeicao CHECK (
+        Status <> 'REJEITADA' OR (RejeitadaEm IS NOT NULL AND BloqueadoAte IS NOT NULL))
 );
+
+-- Um EAN só pode ter uma ficha viva (em andamento ou concluída); rejeitada/cancelada liberam
+CREATE UNIQUE INDEX UX_PF_PreFicha_EANViva ON dbo.PF_PreFicha (EAN)
+    WHERE Status <> 'REJEITADA' AND Status <> 'CANCELADA';
+CREATE INDEX IX_PF_PreFicha_EAN ON dbo.PF_PreFicha (EAN, RejeitadaEm);
 
 /* Fluxo de aprovação da pré-ficha, definido na CONFIGURAÇÃO (vale para toda ficha).
    Ordem igual  = aprovação simultânea; Ordem diferente = sequencial (menor primeiro).
@@ -222,7 +238,57 @@ CREATE TABLE dbo.PF_PreFichaValorLog (
 );
 CREATE INDEX IX_PF_PFVL_Ficha ON dbo.PF_PreFichaValorLog (PreFichaCodigo, CampoId);
 
-/* ---------- 6. Integrações (ERP, e-commerce, ...) ----------
+/* ---------- 6. Base de produtos, parâmetros e liberações ----------
+   Base inicial: produtos que já existem no ERP, carregados por planilha (chave = EAN).
+   Produto na base não pode ser solicitado. */
+CREATE TABLE dbo.PF_CargaBase (
+    CargaId         INT IDENTITY(1,1) CONSTRAINT PK_PF_CargaBase PRIMARY KEY,
+    UsuarioCosmosId INT           NOT NULL,
+    Arquivo         NVARCHAR(260) NULL,
+    Recebidos       INT           NOT NULL,
+    Novos           INT           NOT NULL,
+    Atualizados     INT           NOT NULL,
+    Invalidos       INT           NOT NULL,
+    Em              DATETIME2     NOT NULL CONSTRAINT DF_PF_CargaBase_Em DEFAULT SYSUTCDATETIME()
+);
+
+CREATE TABLE dbo.PF_ProdutoBase (
+    EAN           VARCHAR(14)   NOT NULL CONSTRAINT PK_PF_ProdutoBase PRIMARY KEY,
+    Descricao     NVARCHAR(200) NULL,
+    CargaId       INT           NULL,
+    AtualizadoEm  DATETIME2     NOT NULL CONSTRAINT DF_PF_ProdutoBase_Em DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT CK_PF_ProdutoBase_EAN CHECK (LEN(EAN) = 14 AND EAN NOT LIKE '%[^0-9]%'),
+    CONSTRAINT FK_PF_ProdutoBase_Carga FOREIGN KEY (CargaId) REFERENCES dbo.PF_CargaBase (CargaId)
+);
+
+-- Parâmetros gerais (editáveis pelo gestor)
+CREATE TABLE dbo.PF_Parametro (
+    Chave     VARCHAR(50)   NOT NULL CONSTRAINT PK_PF_Parametro PRIMARY KEY,
+    Valor     NVARCHAR(200) NOT NULL,
+    Descricao NVARCHAR(300) NULL,
+    SysIni    DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL,
+    SysFim    DATETIME2 GENERATED ALWAYS AS ROW END   HIDDEN NOT NULL,
+    PERIOD FOR SYSTEM_TIME (SysIni, SysFim)
+) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.PF_ParametroHist));
+
+-- VALOR INICIAL DE EXEMPLO: o gestor deve definir o prazo real (em dias)
+INSERT dbo.PF_Parametro (Chave, Valor, Descricao)
+VALUES ('DIAS_BLOQUEIO_REJEICAO', N'90', N'Dias em que um EAN rejeitado fica impedido de ser solicitado novamente');
+
+-- Exceção do gestor: libera um EAN rejeitado antes do prazo (uso único)
+CREATE TABLE dbo.PF_LiberacaoEAN (
+    LiberacaoId     INT IDENTITY(1,1) CONSTRAINT PK_PF_LiberacaoEAN PRIMARY KEY,
+    EAN             VARCHAR(14)   NOT NULL,
+    Motivo          NVARCHAR(500) NOT NULL,
+    LiberadaPor     INT           NOT NULL,
+    LiberadaEm      DATETIME2     NOT NULL CONSTRAINT DF_PF_LibEAN_Em DEFAULT SYSUTCDATETIME(),
+    UsadaEm         DATETIME2     NULL,
+    PreFichaUsada   INT           NULL,
+    CONSTRAINT FK_PF_LibEAN_Ficha FOREIGN KEY (PreFichaUsada) REFERENCES dbo.PF_PreFicha (PreFichaCodigo)
+);
+CREATE INDEX IX_PF_LibEAN ON dbo.PF_LiberacaoEAN (EAN, UsadaEm);
+
+/* ---------- 7. Integrações (ERP, e-commerce, ...) ----------
    Etapa do construtor: para cada integração, quais campos são enviados e com que
    nome no destino. O envio acontece após a aprovação (ficha CONCLUIDA). */
 CREATE TABLE dbo.PF_Integracao (
@@ -400,7 +466,7 @@ GO
    @ValoresJson: [{"campoId":1,"valor":"texto"}, ...]  (número com ponto decimal)
    @ValidarObrigatorios = 1 ao concluir a fase (valida o que falta preencher)
    Regras:
-     - ficha encerrada (CONCLUIDA/CANCELADA) não aceita alteração
+     - ficha encerrada (CONCLUIDA/REJEITADA/CANCELADA) não aceita alteração
      - fornecedor não altera durante a aprovação da pré-ficha
      - ficha EM_AJUSTE (reprovada): só o fornecedor edita (e o ADMIN); em reprovação
        total ele reabre todos os campos dele, em parcial só os campos com pendência aberta
@@ -431,7 +497,7 @@ BEGIN
     IF @Perfil IS NULL THROW 50002, 'Usuário sem perfil na plataforma.', 1;
     IF @Perfil = 'FORNECEDOR' AND @Fornecedor <> @UsuarioCosmosId
         THROW 50003, 'Fornecedor só pode alterar a própria ficha.', 1;
-    IF @Status IN ('CONCLUIDA','CANCELADA')
+    IF @Status IN ('CONCLUIDA','REJEITADA','CANCELADA')
         THROW 50004, 'Ficha encerrada não aceita alterações.', 1;
     IF @Perfil = 'FORNECEDOR' AND @Status = 'PRE_FICHA_APROVACAO'
         THROW 50005, 'Pré-ficha em aprovação: o fornecedor não pode alterar.', 1;
@@ -571,6 +637,160 @@ END;
 GO
 
 /* =============================================================================
+   EAN: normalização, carga da base, criação da pré-ficha e liberação
+   ============================================================================= */
+
+-- Aceita 8, 12, 13 ou 14 dígitos e devolve o GTIN-14 (zeros à esquerda). Inválido = NULL.
+-- (Planilhas que tratam EAN como número perdem zeros à esquerda; o preenchimento corrige.)
+CREATE FUNCTION dbo.PF_fn_NormalizarEAN (@EAN NVARCHAR(50))
+RETURNS VARCHAR(14) AS
+BEGIN
+    DECLARE @e VARCHAR(50) = LTRIM(RTRIM(@EAN));
+    IF @e IS NULL OR @e = '' OR @e LIKE '%[^0-9]%' OR LEN(@e) NOT IN (8, 12, 13, 14)
+        RETURN NULL;
+    RETURN RIGHT(REPLICATE('0', 14) + @e, 14);
+END;
+GO
+
+/* CARGA DA BASE (planilha): só perfil ADMIN (gestor).
+   @ProdutosJson: [{"ean":"7891234567895","descricao":"opcional"}, ...]
+   Inclui EANs novos e atualiza a descrição dos existentes; nunca remove.
+   EAN inválido não aborta a carga: é contado e devolvido no segundo resultado. */
+CREATE PROCEDURE dbo.PF_usp_ImportarBase
+    @UsuarioCosmosId INT,
+    @ProdutosJson    NVARCHAR(MAX),
+    @Arquivo         NVARCHAR(260) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF ISNULL(dbo.PF_fn_PerfilUsuario(@UsuarioCosmosId), '') <> 'ADMIN'
+        THROW 50050, 'Apenas gestores podem carregar a base de produtos.', 1;
+
+    SELECT Ean AS EanOriginal, dbo.PF_fn_NormalizarEAN(Ean) AS EAN, NULLIF(LTRIM(RTRIM(Descricao)), N'') AS Descricao,
+           ROW_NUMBER() OVER (PARTITION BY dbo.PF_fn_NormalizarEAN(Ean) ORDER BY (SELECT NULL)) AS Rn
+    INTO #Linhas
+    FROM OPENJSON(@ProdutosJson) WITH (Ean NVARCHAR(50) '$.ean', Descricao NVARCHAR(200) '$.descricao');
+
+    DECLARE @Recebidos INT = (SELECT COUNT(*) FROM #Linhas);
+    DECLARE @Invalidos INT = (SELECT COUNT(*) FROM #Linhas WHERE EAN IS NULL);
+    DECLARE @Acoes TABLE (Acao NVARCHAR(10));
+    DECLARE @CargaId INT;
+
+    BEGIN TRAN;
+
+    INSERT dbo.PF_CargaBase (UsuarioCosmosId, Arquivo, Recebidos, Novos, Atualizados, Invalidos)
+    VALUES (@UsuarioCosmosId, @Arquivo, @Recebidos, 0, 0, @Invalidos);
+    SET @CargaId = SCOPE_IDENTITY();
+
+    MERGE dbo.PF_ProdutoBase AS t
+    USING (SELECT EAN, Descricao FROM #Linhas WHERE EAN IS NOT NULL AND Rn = 1) AS s ON t.EAN = s.EAN
+    WHEN MATCHED THEN
+        UPDATE SET Descricao = COALESCE(s.Descricao, t.Descricao), CargaId = @CargaId, AtualizadoEm = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN
+        INSERT (EAN, Descricao, CargaId) VALUES (s.EAN, s.Descricao, @CargaId)
+    OUTPUT $action INTO @Acoes;
+
+    UPDATE dbo.PF_CargaBase
+    SET Novos       = (SELECT COUNT(*) FROM @Acoes WHERE Acao = 'INSERT'),
+        Atualizados = (SELECT COUNT(*) FROM @Acoes WHERE Acao = 'UPDATE')
+    WHERE CargaId = @CargaId;
+
+    COMMIT;
+
+    SELECT * FROM dbo.PF_CargaBase WHERE CargaId = @CargaId;
+    SELECT EanOriginal FROM #Linhas WHERE EAN IS NULL;
+END;
+GO
+
+/* CRIAR PRÉ-FICHA (fornecedor informa o EAN). Impede a solicitação quando:
+     - EAN inválido;
+     - produto já existe no ERP (PF_ProdutoBase);
+     - já existe ficha em andamento ou concluída para o EAN;
+     - EAN rejeitado e ainda dentro do prazo de bloqueio, sem liberação do gestor.
+   Devolve o PreFichaCodigo criado. */
+CREATE PROCEDURE dbo.PF_usp_CriarPreFicha
+    @UsuarioCosmosId INT,
+    @EAN             NVARCHAR(50)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF ISNULL(dbo.PF_fn_PerfilUsuario(@UsuarioCosmosId), '') <> 'FORNECEDOR'
+        THROW 50040, 'Apenas fornecedores podem solicitar cadastro de produto.', 1;
+
+    DECLARE @e VARCHAR(14) = dbo.PF_fn_NormalizarEAN(@EAN);
+    IF @e IS NULL THROW 50041, 'EAN inválido.', 1;
+
+    IF EXISTS (SELECT 1 FROM dbo.PF_ProdutoBase WHERE EAN = @e)
+        THROW 50042, 'Produto já cadastrado no ERP. Solicitação não permitida.', 1;
+
+    IF EXISTS (SELECT 1 FROM dbo.PF_PreFicha WHERE EAN = @e AND Status <> 'REJEITADA' AND Status <> 'CANCELADA')
+        THROW 50043, 'Já existe solicitação em andamento ou concluída para este EAN.', 1;
+
+    BEGIN TRAN;
+
+    -- Rejeição mais recente do EAN ainda dentro do prazo?
+    DECLARE @RejeitadaEm DATETIME2, @BloqueadoAte DATETIME2, @LiberacaoId INT;
+    SELECT TOP (1) @RejeitadaEm = RejeitadaEm, @BloqueadoAte = BloqueadoAte
+    FROM dbo.PF_PreFicha WHERE EAN = @e AND Status = 'REJEITADA'
+    ORDER BY RejeitadaEm DESC;
+
+    IF @BloqueadoAte IS NOT NULL AND @BloqueadoAte > SYSUTCDATETIME()
+    BEGIN
+        -- Exceção do gestor: liberação de uso único, posterior à rejeição
+        SELECT TOP (1) @LiberacaoId = LiberacaoId
+        FROM dbo.PF_LiberacaoEAN WITH (UPDLOCK)
+        WHERE EAN = @e AND UsadaEm IS NULL AND LiberadaEm >= @RejeitadaEm
+        ORDER BY LiberadaEm DESC;
+
+        IF @LiberacaoId IS NULL
+        BEGIN
+            DECLARE @MsgBloq NVARCHAR(200) = CONCAT(N'EAN rejeitado anteriormente. Nova solicitação só após ',
+                CONVERT(NVARCHAR(10), @BloqueadoAte, 103), N' ou com liberação do gestor.');
+            THROW 50044, @MsgBloq, 1;
+        END
+    END
+
+    INSERT dbo.PF_PreFicha (EAN, FornecedorUsuarioId) VALUES (@e, @UsuarioCosmosId);
+    DECLARE @Codigo INT = SCOPE_IDENTITY();
+
+    IF @LiberacaoId IS NOT NULL
+        UPDATE dbo.PF_LiberacaoEAN SET UsadaEm = SYSUTCDATETIME(), PreFichaUsada = @Codigo WHERE LiberacaoId = @LiberacaoId;
+
+    COMMIT;
+    SELECT @Codigo AS PreFichaCodigo;
+END;
+GO
+
+/* LIBERAR EAN REJEITADO (exceção do gestor): só ADMIN, só se o EAN está bloqueado,
+   motivo obrigatório. Vale para uma única nova solicitação. */
+CREATE PROCEDURE dbo.PF_usp_LiberarEAN
+    @UsuarioCosmosId INT,
+    @EAN             NVARCHAR(50),
+    @Motivo          NVARCHAR(500)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF ISNULL(dbo.PF_fn_PerfilUsuario(@UsuarioCosmosId), '') <> 'ADMIN'
+        THROW 50060, 'Apenas gestores podem liberar um EAN rejeitado.', 1;
+
+    DECLARE @e VARCHAR(14) = dbo.PF_fn_NormalizarEAN(@EAN);
+    IF @e IS NULL THROW 50061, 'EAN inválido.', 1;
+    IF NULLIF(LTRIM(RTRIM(@Motivo)), N'') IS NULL THROW 50062, 'Informe o motivo da liberação.', 1;
+
+    IF NOT EXISTS (SELECT 1 FROM dbo.PF_PreFicha
+                   WHERE EAN = @e AND Status = 'REJEITADA' AND BloqueadoAte > SYSUTCDATETIME())
+        THROW 50063, 'EAN não está bloqueado por rejeição.', 1;
+
+    INSERT dbo.PF_LiberacaoEAN (EAN, Motivo, LiberadaPor) VALUES (@e, LTRIM(RTRIM(@Motivo)), @UsuarioCosmosId);
+END;
+GO
+
+/* =============================================================================
    TODO (fora do desenho atual)
    - Skill + MCP Cosmos Pro para criar tabelas, formulários e customs PF_.
    - Resolver o usuário logado pela sessão/token do Cosmos (confirmar suporte).
@@ -579,11 +799,20 @@ GO
          Ciclo atual, validar obrigatórios, Status = PRE_FICHA_APROVACAO;
        * aprovar/rejeitar por área (rejeitar grava PF_PreFichaPendencia: total = CampoId
          NULL, parcial = um registro por campo), avançar para FICHA_COMPLETA e CONCLUIDA;
+       * rejeitar o produto (definitivo): Status = REJEITADA, RejeitadaEm = agora,
+         BloqueadoAte = agora + PF_Parametro 'DIAS_BLOQUEIO_REJEICAO', MotivoRejeicao;
        * devolver ao fornecedor: Status = EM_AJUSTE + FaseRetorno;
        * reenviar: resolver pendências, Ciclo + 1, voltar à FaseRetorno.
    - Reprovação parcial na FICHA_COMPLETA (áreas em paralelo): definir se as demais
      áreas continuam trabalhando enquanto o fornecedor ajusta.
-   - Tela de configuração do fluxo de aprovação (PF_AprovacaoConfig).
+   - Tela de configuração do fluxo de aprovação (PF_AprovacaoConfig) e dos parâmetros
+     gerais (PF_Parametro); definir o prazo real do bloqueio por rejeição.
+   - Tela de carga da planilha (a leitura do arquivo e o envio em lotes ficam no webapp,
+     que chama PF_usp_ImportarBase) e tela de liberação de EAN pelo gestor.
+   - Validar o dígito verificador do GTIN (hoje só formato e tamanho).
+   - Manter a base atualizada após novos cadastros no ERP (hoje o EAN concluído já fica
+     protegido pela própria ficha); decidir se a planilha deve também remover EANs ausentes.
+   - O EAN da ficha segue no payload das integrações (vem de PF_PreFicha.EAN, não do EAV).
    - Processo de envio das integrações: montar payload (PF_fn_PayloadIntegracao),
      enviar, gravar PF_IntegracaoEnvioLog e atualizar PF_IntegracaoEnvio; reenvio.
    - Concorrência de edição (v2).
